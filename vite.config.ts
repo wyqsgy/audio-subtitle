@@ -21,7 +21,7 @@ export default defineConfig(({ mode }) => {
             build: {
               outDir: 'dist-electron',
               rollupOptions: {
-                external: ['electron', 'child_process', 'fs', 'path', 'url']
+                external: ['electron', 'child_process', 'fs', 'path', 'url', 'http']
               }
             }
           }

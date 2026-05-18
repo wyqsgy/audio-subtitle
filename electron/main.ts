@@ -1,7 +1,8 @@
 import { app, BrowserWindow, ipcMain, screen, Menu, Tray, nativeImage } from 'electron'
-import { spawn, ChildProcess } from 'child_process'
+import { spawn, ChildProcess, execSync } from 'child_process'
 import path from 'path'
 import fs from 'fs'
+import http from 'http'
 import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -12,8 +13,9 @@ let tray: Tray | null = null
 let backendProcess: ChildProcess | null = null
 let isQuitting = false
 
-const BACKEND_URL = 'http://127.0.0.1:8765'
-const WS_URL = 'ws://127.0.0.1:8765/ws'
+const BACKEND_PORT = 8765
+const BACKEND_URL = `http://127.0.0.1:${BACKEND_PORT}`
+const WS_URL = `ws://127.0.0.1:${BACKEND_PORT}/ws`
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL']
 
 function getBackendExePath(): string {
@@ -34,29 +36,53 @@ function getBackendExePath(): string {
   return candidates[0]
 }
 
-function startBackend(): Promise<void> {
-  return new Promise((resolve, reject) => {
+function healthCheck(): Promise<boolean> {
+  return new Promise((resolve) => {
+    const req = http.get(`${BACKEND_URL}/`, (res) => {
+      resolve(res.statusCode === 200)
+    })
+    req.on('error', () => resolve(false))
+    req.setTimeout(1000, () => { req.destroy(); resolve(false) })
+  })
+}
+
+async function waitForBackend(maxRetries = 30, delayMs = 1000): Promise<boolean> {
+  for (let i = 0; i < maxRetries; i++) {
+    if (await healthCheck()) return true
+    if (backendProcess?.exitCode !== null) {
+      console.error('[Main] Backend died during startup')
+      return false
+    }
+    await new Promise(r => setTimeout(r, delayMs))
+  }
+  return false
+}
+
+function startBackend(): Promise<boolean> {
+  return new Promise((resolve) => {
     const isDev = !app.isPackaged
 
     if (isDev) {
       const backendDir = path.join(app.getAppPath(), 'backend')
-      console.log('[Main] Dev mode — launching Python backend from:', backendDir)
+      console.log('[Main] Dev mode — launching Python backend')
 
       backendProcess = spawn('python', [
         '-m', 'uvicorn', 'main:app',
-        '--host', '127.0.0.1', '--port', '8765',
+        '--host', '127.0.0.1',
+        '--port', String(BACKEND_PORT),
         '--log-level', 'warning'
       ], {
         cwd: backendDir,
-        stdio: ['ignore', 'pipe', 'pipe']
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true
       })
     } else {
       const exePath = getBackendExePath()
       console.log('[Main] Production mode — launching:', exePath)
 
       if (!fs.existsSync(exePath)) {
-        console.error('[Main] Backend executable not found:', exePath)
-        reject(new Error(`Backend not found: ${exePath}`))
+        console.error('[Main] Backend exe not found:', exePath)
+        resolve(false)
         return
       }
 
@@ -66,19 +92,20 @@ function startBackend(): Promise<void> {
       })
     }
 
-    backendProcess.stdout?.on('data', (data: Buffer) => {
-      const text = data.toString().trim()
-      if (text) console.log('[Backend]', text)
+    backendProcess.stdout?.on('data', (d: Buffer) => {
+      const t = d.toString().trim()
+      if (t) console.log('[Backend]', t)
     })
 
-    backendProcess.stderr?.on('data', (data: Buffer) => {
-      const text = data.toString().trim()
-      if (text) console.error('[Backend]', text)
+    backendProcess.stderr?.on('data', (d: Buffer) => {
+      const t = d.toString().trim()
+      if (t) console.error('[Backend]', t)
     })
 
     backendProcess.on('error', (err) => {
-      console.error('[Main] Backend error:', err.message)
-      reject(err)
+      console.error('[Main] Backend spawn error:', err.message)
+      backendProcess = null
+      resolve(false)
     })
 
     backendProcess.on('exit', (code) => {
@@ -86,15 +113,20 @@ function startBackend(): Promise<void> {
       backendProcess = null
     })
 
-    setTimeout(() => resolve(), 2000)
+    waitForBackend().then(resolve)
   })
 }
 
 function stopBackend() {
-  if (backendProcess) {
-    backendProcess.kill()
-    backendProcess = null
+  if (!backendProcess) return
+
+  if (backendProcess.pid) {
+    try {
+      execSync(`taskkill /pid ${backendProcess.pid} /f /t 2>nul`, { windowsHide: true })
+    } catch { /* already dead */ }
   }
+
+  backendProcess = null
 }
 
 function createWindow() {
@@ -113,6 +145,7 @@ function createWindow() {
     resizable: true,
     skipTaskbar: true,
     hasShadow: false,
+    show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: false,
@@ -125,6 +158,10 @@ function createWindow() {
   } else {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html'))
   }
+
+  mainWindow.once('ready-to-show', () => {
+    mainWindow?.show()
+  })
 
   mainWindow.on('close', (e) => {
     if (!isQuitting) {
@@ -171,11 +208,11 @@ function createTray() {
   tray = new Tray(icon)
 
   const updateMenu = () => {
-    const isVisible = mainWindow?.isVisible() ?? false
+    const visible = mainWindow?.isVisible() ?? false
     const menu = Menu.buildFromTemplate([
       {
-        label: isVisible ? '隐藏字幕窗口' : '显示字幕窗口',
-        click: () => isVisible ? mainWindow?.hide() : (mainWindow?.show(), mainWindow?.focus())
+        label: visible ? '隐藏字幕窗口' : '显示字幕窗口',
+        click: () => visible ? mainWindow?.hide() : (mainWindow?.show(), mainWindow?.focus())
       },
       { label: '设置', click: createSettingsWindow },
       { type: 'separator' },
@@ -194,7 +231,14 @@ function createTray() {
 }
 
 app.whenReady().then(async () => {
-  try { await startBackend() } catch (e) { console.error('[Main] Backend start failed:', e) }
+  console.log('[Main] Starting backend...')
+  const backendReady = await startBackend()
+
+  if (backendReady) {
+    console.log('[Main] Backend ready')
+  } else {
+    console.error('[Main] Backend failed to start — showing app anyway')
+  }
 
   createWindow()
   createTray()
@@ -204,8 +248,14 @@ app.whenReady().then(async () => {
   })
 })
 
-app.on('before-quit', () => { isQuitting = true; stopBackend() })
-app.on('window-all-closed', () => { stopBackend() })
+app.on('before-quit', () => {
+  isQuitting = true
+  stopBackend()
+})
+
+app.on('window-all-closed', () => {
+  stopBackend()
+})
 
 ipcMain.handle('open-settings', () => createSettingsWindow())
 ipcMain.handle('get-backend-url', () => BACKEND_URL)
@@ -222,4 +272,8 @@ ipcMain.handle('resize-window', (_event, width: number, height: number) => {
   return { success: true }
 })
 
-ipcMain.handle('quit-app', () => { isQuitting = true; stopBackend(); app.quit() })
+ipcMain.handle('quit-app', () => {
+  isQuitting = true
+  stopBackend()
+  app.quit()
+})

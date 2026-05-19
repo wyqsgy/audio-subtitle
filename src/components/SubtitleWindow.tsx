@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
-import { Settings, Play, Square, X, Minimize2, ChevronsUpDown, Wifi, WifiOff } from 'lucide-react'
+import { Settings, Play, Square, X, Minimize2, ChevronsUpDown, History, Keyboard } from 'lucide-react'
 import type { AppSettings } from '../App'
 
 interface SubtitleWindowProps {
@@ -7,9 +7,24 @@ interface SubtitleWindowProps {
   subtitle: { text: string; translation: string }
   isCapturing: boolean
   isConnected: boolean
+  audioLevel: number
   onToggleCapture: () => void
   onOpenSettings: () => void
   onClose?: () => void
+}
+
+interface HistoryItem {
+  id: number
+  text: string
+  translation: string
+  timestamp: number
+}
+
+let idCounter = 0
+
+function formatTime(ts: number): string {
+  const d = new Date(ts)
+  return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
 function SubtitleWindow({
@@ -17,83 +32,163 @@ function SubtitleWindow({
   subtitle,
   isCapturing,
   isConnected,
+  audioLevel,
   onToggleCapture,
   onOpenSettings,
   onClose
 }: SubtitleWindowProps) {
   const [collapsed, setCollapsed] = useState(false)
+  const [showHistory, setShowHistory] = useState(false)
+  const [showShortcuts, setShowShortcuts] = useState(false)
+  const [history, setHistory] = useState<HistoryItem[]>([])
+  const [currentItem, setCurrentItem] = useState<HistoryItem | null>(null)
+  const [fadeState, setFadeState] = useState<'enter' | 'show' | 'exit'>('enter')
   const textRef = useRef<HTMLDivElement>(null)
-  const prevTextLen = useRef(0)
+  const prevKey = useRef('')
+  const fadeTimer = useRef<ReturnType<typeof setTimeout>>()
 
   useEffect(() => {
-    const text = subtitle.text + subtitle.translation
-    if (text.length === prevTextLen.current) return
-    prevTextLen.current = text.length
+    const key = subtitle.text + '|' + subtitle.translation
+    if (!key || key === prevKey.current) return
+    prevKey.current = key
 
-    if (collapsed) return
+    const item: HistoryItem = {
+      id: ++idCounter,
+      text: subtitle.text,
+      translation: subtitle.translation,
+      timestamp: Date.now()
+    }
 
+    clearTimeout(fadeTimer.current)
+
+    if (currentItem && currentItem.text) {
+      setFadeState('exit')
+      fadeTimer.current = setTimeout(() => {
+        setCurrentItem(item)
+        setHistory(prev => [item, ...prev].slice(0, 50))
+        setFadeState('enter')
+        fadeTimer.current = setTimeout(() => setFadeState('show'), 50)
+      }, 200)
+    } else {
+      setCurrentItem(item)
+      setHistory(prev => [item, ...prev].slice(0, 50))
+      setFadeState('enter')
+      fadeTimer.current = setTimeout(() => setFadeState('show'), 50)
+    }
+  }, [subtitle.text, subtitle.translation])
+
+  useEffect(() => {
+    return () => clearTimeout(fadeTimer.current)
+  }, [])
+
+  useEffect(() => {
+    const onToggleHistory = () => setShowHistory(prev => !prev)
+    const onToggleCollapse = () => {
+      setCollapsed(prev => {
+        const next = !prev
+        if (next) setShowHistory(false)
+        window.electronAPI?.resizeWindow(400, next ? 38 : 120)
+        return next
+      })
+    }
+
+    window.addEventListener('toggle-history', onToggleHistory)
+    window.addEventListener('toggle-collapse', onToggleCollapse)
+    return () => {
+      window.removeEventListener('toggle-history', onToggleHistory)
+      window.removeEventListener('toggle-collapse', onToggleCollapse)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (collapsed || showHistory) return
     const el = textRef.current
-    if (!el) return
+    if (!el || !currentItem) return
 
     requestAnimationFrame(() => {
+      const fullText = currentItem.text + currentItem.translation
       const scrollH = el.scrollHeight
       const controlH = 38
       const padding = 24
       const totalH = Math.min(scrollH + controlH + padding, 300)
-      const minH = collapsed ? controlH : 80
-
-      const height = Math.max(minH, totalH)
-      const width = Math.min(Math.max(text.length * settings.fontSize * 0.65 + 40, 400), 1200)
+      const height = Math.max(80, totalH)
+      const width = Math.min(Math.max(fullText.length * settings.fontSize * 0.6 + 40, 400), 1200)
 
       window.electronAPI?.resizeWindow(Math.round(width), Math.round(height))
     })
-  }, [subtitle.text, subtitle.translation, collapsed, settings.fontSize])
+  }, [currentItem, collapsed, showHistory, settings.fontSize])
+
+  useEffect(() => {
+    if (showHistory) {
+      window.electronAPI?.resizeWindow(520, 400)
+    }
+  }, [showHistory])
 
   const handleCollapse = () => {
     const next = !collapsed
     setCollapsed(next)
     if (next) {
-      window.electronAPI?.resizeWindow(400, 38)
-    } else {
-      window.electronAPI?.resizeWindow(800, 120)
+      setShowHistory(false)
+    }
+    window.electronAPI?.resizeWindow(400, next ? 38 : 120)
+  }
+
+  const handleHistoryToggle = () => {
+    const next = !showHistory
+    setShowHistory(next)
+    if (next) {
+      setCollapsed(false)
     }
   }
 
-  const renderContent = () => {
-    const { displayMode } = settings
-
-    if (!subtitle.text && !subtitle.translation) {
+  const renderText = () => {
+    if (!currentItem || (!currentItem.text && !currentItem.translation)) {
       return (
         <span className="placeholder-text">
-          {!isConnected ? '正在连接服务...' : isCapturing ? '正在监听...' : '点击 ▶ 开始捕获音频'}
+          {!isConnected
+            ? '等待服务连接...'
+            : isCapturing
+              ? <span className="listening-dots">监听中<span className="animated-dots" /></span>
+              : (
+                <span>
+                  按 <kbd className="key-hint">Space</kbd> 开始捕获 &middot;
+                  <kbd className="key-hint">H</kbd> 历史 &middot;
+                  <kbd className="key-hint">S</kbd> 设置
+                </span>
+              )}
         </span>
       )
     }
 
+    const { displayMode } = settings
+
     if (displayMode === 'original') {
-      return subtitle.text
+      return currentItem.text
     }
 
     if (displayMode === 'translation') {
-      return subtitle.translation || subtitle.text
+      return currentItem.translation || currentItem.text
     }
 
     return (
       <>
-        {subtitle.text && <div>{subtitle.text}</div>}
-        {subtitle.translation && (
-          <div className="translation-line">{subtitle.translation}</div>
+        {currentItem.text && <div>{currentItem.text}</div>}
+        {currentItem.translation && (
+          <div className="translation-line">{currentItem.translation}</div>
         )}
       </>
     )
   }
+
+  const levelPercent = Math.min(audioLevel * 1.5, 1)
 
   return (
     <div
       className="subtitle-window"
       style={{
         backgroundColor: settings.backgroundColor,
-        opacity: settings.opacity
+        opacity: settings.opacity,
+        transition: 'opacity 0.3s ease'
       }}
     >
       <div className="drag-bar">
@@ -102,20 +197,45 @@ function SubtitleWindow({
           拖动移动
         </span>
 
-        <div className="status-dot">
-          {isConnected ? (
-            <span className="dot green" title="已连接" />
-          ) : (
-            <span className="dot red" title="未连接" />
+        <div className="status-area">
+          {isCapturing && (
+            <div className="audio-level-bar">
+              <div
+                className="audio-level-fill"
+                style={{
+                  width: `${levelPercent * 100}%`,
+                  backgroundColor: levelPercent > 0.6 ? '#4ade80' : levelPercent > 0.2 ? '#fbbf24' : '#f87171'
+                }}
+              />
+            </div>
           )}
+          <span className={`status-pill ${isConnected ? 'online' : 'offline'}`} title={isConnected ? '已连接' : '未连接'}>
+            {isConnected ? '●' : '○'} {isConnected ? '已连接' : '未连接'}
+          </span>
+          {isCapturing && <span className="status-pill capturing">录制中</span>}
         </div>
 
         <div className="action-buttons">
           <button
-            className="action-btn"
+            className="action-btn" onClick={() => setShowShortcuts(!showShortcuts)}
+            title="快捷键"
+          >
+            <Keyboard size={14} />
+          </button>
+
+          <button
+            className={`action-btn ${showHistory ? 'active' : ''}`}
+            onClick={handleHistoryToggle}
+            title="历史记录"
+          >
+            <History size={15} />
+          </button>
+
+          <button
+            className={`action-btn play-btn ${isCapturing ? 'active' : ''}`}
             onClick={onToggleCapture}
             disabled={!isConnected}
-            title={isCapturing ? '停止捕获' : '开始捕获'}
+            title={isCapturing ? '停止捕获 (Space)' : '开始捕获 (Space)'}
           >
             {isCapturing ? <Square size={15} /> : <Play size={15} />}
           </button>
@@ -134,16 +254,57 @@ function SubtitleWindow({
         </div>
       </div>
 
-      {!collapsed && (
+      {showShortcuts && (
+        <div className="shortcuts-panel">
+          <div className="shortcuts-title">键盘快捷键</div>
+          <div className="shortcuts-grid">
+            <div><kbd className="kbd">Space</kbd> 开始 / 停止捕获</div>
+            <div><kbd className="kbd">Esc</kbd> 停止捕获 / 关闭设置</div>
+            <div><kbd className="kbd">Ctrl+H</kbd> 显示 / 隐藏窗口</div>
+            <div><kbd className="kbd">H</kbd> 历史记录</div>
+            <div><kbd className="kbd">S</kbd> 设置</div>
+            <div><kbd className="kbd">D</kbd> 折叠 / 展开</div>
+          </div>
+        </div>
+      )}
+
+      {showHistory && !collapsed && (
+        <div className="history-panel">
+          <div className="history-header">
+            <span>字幕历史</span>
+            <span className="history-count">{history.length} 条</span>
+          </div>
+          <div className="history-list">
+            {history.length === 0 ? (
+              <div className="history-empty">暂无历史记录</div>
+            ) : (
+              history.map(item => (
+                <div key={item.id} className="history-row">
+                  <span className="history-time">{formatTime(item.timestamp)}</span>
+                  <div className="history-text">
+                    <div className="history-original">{item.text || '<空>'}</div>
+                    {item.translation && (
+                      <div className="history-translation">{item.translation}</div>
+                    )}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+
+      {!collapsed && !showHistory && (
         <div
           ref={textRef}
-          className="text-area"
+          className={`text-area fade-${fadeState}`}
           style={{
             fontSize: settings.fontSize,
-            color: settings.textColor
+            color: settings.textColor,
+            transition: 'opacity 0.18s ease, transform 0.18s ease'
           }}
         >
-          {renderContent()}
+          {renderText()}
         </div>
       )}
     </div>

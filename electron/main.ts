@@ -12,11 +12,14 @@ let settingsWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let backendProcess: ChildProcess | null = null
 let isQuitting = false
+let backendRestartAttempts = 0
+let backendRestartTimer: ReturnType<typeof setTimeout> | null = null
 
 const BACKEND_PORT = 8765
 const BACKEND_URL = `http://127.0.0.1:${BACKEND_PORT}`
 const WS_URL = `ws://127.0.0.1:${BACKEND_PORT}/ws`
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL']
+const POSITION_FILE = path.join(app.getPath('userData'), 'window-position.json')
 
 function getBackendExePath(): string {
   if (!app.isPackaged) {
@@ -111,6 +114,9 @@ function startBackend(): Promise<boolean> {
     backendProcess.on('exit', (code) => {
       console.log('[Main] Backend exited:', code)
       backendProcess = null
+      if (!isQuitting) {
+        scheduleBackendRestart()
+      }
     })
 
     waitForBackend().then(resolve)
@@ -118,6 +124,10 @@ function startBackend(): Promise<boolean> {
 }
 
 function stopBackend() {
+  if (backendRestartTimer) {
+    clearTimeout(backendRestartTimer)
+    backendRestartTimer = null
+  }
   if (!backendProcess) return
 
   if (backendProcess.pid) {
@@ -129,16 +139,59 @@ function stopBackend() {
   backendProcess = null
 }
 
+function loadWindowPosition(): { x?: number; y?: number } | null {
+  try {
+    if (fs.existsSync(POSITION_FILE)) {
+      return JSON.parse(fs.readFileSync(POSITION_FILE, 'utf-8'))
+    }
+  } catch { /* ignore */ }
+  return null
+}
+
+function saveWindowPosition(x: number, y: number) {
+  try {
+    fs.writeFileSync(POSITION_FILE, JSON.stringify({ x, y }), 'utf-8')
+  } catch { /* ignore */ }
+}
+
+function scheduleBackendRestart() {
+  if (isQuitting) return
+  if (backendRestartAttempts >= 5) {
+    console.error('[Main] Backend restart limit reached')
+    return
+  }
+
+  const delay = Math.min(2000 * Math.pow(2, backendRestartAttempts), 30000)
+  backendRestartAttempts++
+  console.log(`[Main] Scheduling backend restart in ${delay}ms (attempt ${backendRestartAttempts}/5)`)
+
+  backendRestartTimer = setTimeout(async () => {
+    backendRestartTimer = null
+    console.log('[Main] Restarting backend...')
+    const ok = await startBackend()
+    if (ok) {
+      backendRestartAttempts = 0
+      console.log('[Main] Backend restarted successfully')
+    } else {
+      scheduleBackendRestart()
+    }
+  }, delay)
+}
+
 function createWindow() {
   const { width: screenW, height: screenH } = screen.getPrimaryDisplay().workAreaSize
   const winW = 800
   const winH = 120
 
+  const saved = loadWindowPosition()
+  const defaultX = Math.round((screenW - winW) / 2)
+  const defaultY = screenH - winH - 60
+
   mainWindow = new BrowserWindow({
     width: winW,
     height: winH,
-    x: Math.round((screenW - winW) / 2),
-    y: screenH - winH - 60,
+    x: saved?.x ?? defaultX,
+    y: saved?.y ?? defaultY,
     frame: false,
     transparent: true,
     alwaysOnTop: true,
@@ -262,14 +315,31 @@ ipcMain.handle('get-backend-url', () => BACKEND_URL)
 ipcMain.handle('get-ws-url', () => WS_URL)
 ipcMain.handle('minimize-window', () => mainWindow?.minimize())
 ipcMain.handle('hide-window', () => mainWindow?.hide())
+ipcMain.handle('show-window', () => {
+  mainWindow?.show()
+  mainWindow?.focus()
+})
 
 ipcMain.handle('resize-window', (_event, width: number, height: number) => {
   if (mainWindow && !mainWindow.isDestroyed()) {
     const [x, y] = mainWindow.getPosition()
     const { height: screenH } = screen.getPrimaryDisplay().workAreaSize
     mainWindow.setBounds({ x, y: Math.min(y, screenH - height - 30), width, height }, true)
+    saveWindowPosition(x, Math.min(y, screenH - height - 30))
   }
   return { success: true }
+})
+
+ipcMain.handle('save-window-position', (_event, x: number, y: number) => {
+  saveWindowPosition(x, y)
+})
+
+ipcMain.handle('get-window-position', () => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    const [x, y] = mainWindow.getPosition()
+    return { x, y }
+  }
+  return loadWindowPosition()
 })
 
 ipcMain.handle('quit-app', () => {

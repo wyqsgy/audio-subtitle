@@ -141,25 +141,52 @@ async def process_audio_stream(device_id: str, translate: bool, chunk_duration: 
     if not audio_capture or not audio_buffer:
         return
 
+    import time
+    import numpy as np
+    last_level_time = 0
+
     try:
         async for chunk in audio_capture.start_capture(device_id):
             audio_buffer.add(chunk)
+
+            now = time.time()
+            if now - last_level_time > 0.2:
+                arr = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+                if len(arr) > 0:
+                    rms = float(np.sqrt(np.mean(arr * arr)) / 32768.0)
+                    await broadcast_level(rms)
+                last_level_time = now
+
             if audio_buffer.duration >= chunk_duration:
                 data = audio_buffer.get(chunk_duration)
                 audio_buffer.clear()
                 if subtitle_service:
                     result = await subtitle_service.process(data, translate)
                     if result["original"]:
-                        await broadcast({"original": result["original"],
-                                          "translation": result["translation"]})
+                        await broadcast_subtitle({
+                            "original": result["original"],
+                            "translation": result["translation"]
+                        })
     except asyncio.CancelledError:
         pass
     except Exception as e:
         logger.error(f"Stream error: {e}")
 
 
-async def broadcast(result: dict):
+async def broadcast_subtitle(result: dict):
     msg = json.dumps({"type": "subtitle", "data": result}, ensure_ascii=False)
+    dead = []
+    for client in connected_clients:
+        try:
+            await client.send_text(msg)
+        except Exception:
+            dead.append(client)
+    for d in dead:
+        connected_clients.remove(d)
+
+
+async def broadcast_level(rms: float):
+    msg = json.dumps({"type": "audio_level", "data": {"level": rms}}, ensure_ascii=False)
     dead = []
     for client in connected_clients:
         try:

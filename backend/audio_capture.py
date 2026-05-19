@@ -8,18 +8,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 try:
-    import pyaudio
-    PYAUDIO_AVAILABLE = True
+    import sounddevice as sd
+    SOUNDDEVICE_AVAILABLE = True
 except ImportError:
-    PYAUDIO_AVAILABLE = False
-    logger.warning("PyAudio not available. Run: pip install pyaudio")
-
-try:
-    from pycaw.pycaw import AudioUtilities, IAudioMeterInformation
-    from comtypes import CLSCTX_ALL
-    PYCAW_AVAILABLE = True
-except ImportError:
-    PYCAW_AVAILABLE = False
+    SOUNDDEVICE_AVAILABLE = False
+    logger.warning("sounddevice not available. Run: pip install sounddevice")
 
 
 @dataclass
@@ -34,87 +27,226 @@ class AudioCapture:
     def __init__(self, config: Optional[AudioConfig] = None):
         self.config = config or AudioConfig()
         self.is_capturing = False
-        self.audio = None
         self.stream = None
-        self.meter = None
 
-        if PYAUDIO_AVAILABLE:
-            try:
-                self.audio = pyaudio.PyAudio()
-            except Exception as e:
-                logger.error(f"Failed to init PyAudio: {e}")
-
-        if PYCAW_AVAILABLE:
-            try:
-                devices = AudioUtilities.GetSpeakers()
-                interface = devices.Activate(IAudioMeterInformation._iid_, CLSCTX_ALL, None)
-                self.meter = interface.QueryInterface(IAudioMeterInformation)
-            except Exception:
-                pass
+    def _get_wasapi_hostapi_index(self) -> Optional[int]:
+        try:
+            hostapis = sd.query_hostapis()
+            for i, api in enumerate(hostapis):
+                if 'wasapi' in api['name'].lower():
+                    return i
+        except Exception:
+            pass
+        return None
 
     def get_audio_devices(self) -> list:
         devices = []
-        if not self.audio:
-            return [{"id": "default", "name": "默认麦克风（PyAudio 不可用）", "type": "microphone"}]
+        if not SOUNDDEVICE_AVAILABLE:
+            return [
+                {"id": "default", "name": "默认麦克风（驱动未安装）", "type": "microphone"},
+                {"id": "system", "name": "系统音频输出（驱动未安装）", "type": "system"}
+            ]
+
+        wasapi_idx = self._get_wasapi_hostapi_index()
 
         try:
-            default_input = self.audio.get_default_input_device_info()
-            devices.append({
-                "id": "default",
-                "name": default_input.get("name", "默认麦克风"),
-                "type": "microphone",
-                "sample_rate": int(default_input.get("defaultSampleRate", 16000))
-            })
-        except Exception:
-            devices.append({"id": "default", "name": "默认麦克风", "type": "microphone"})
+            all_devices = sd.query_devices()
+            for i, dev in enumerate(all_devices):
+                if dev['max_input_channels'] <= 0:
+                    continue
 
-        for i in range(self.audio.get_device_count()):
-            try:
-                info = self.audio.get_device_info_by_index(i)
-                if info.get("maxInputChannels", 0) > 0:
+                is_wasapi = wasapi_idx is not None and dev.get('hostapi') == wasapi_idx
+                name = dev['name']
+                t = 'microphone'
+
+                if is_wasapi and 'loopback' in name.lower():
+                    t = 'system'
+                    devices.append({
+                        "id": f"wasapi_loopback_{i}",
+                        "name": f"系统音频 (WASAPI Loopback)",
+                        "type": "system",
+                        "sample_rate": int(dev['default_samplerate'])
+                    })
+                elif not is_wasapi or 'loopback' not in name.lower():
+                    label = "WASAPI" if is_wasapi else "MME"
                     devices.append({
                         "id": str(i),
-                        "name": info.get("name", f"设备 {i}"),
+                        "name": f"[{label}] {name}",
                         "type": "microphone",
-                        "sample_rate": int(info.get("defaultSampleRate", 16000))
+                        "sample_rate": int(dev['default_samplerate'])
                     })
-            except Exception:
-                continue
+        except Exception as e:
+            logger.error(f"Device query error: {e}")
 
-        devices.append({"id": "system", "name": "系统音频输出 (Stereo Mix / Loopback)", "type": "system"})
+        if not any(d['type'] == 'system' for d in devices):
+            devices.append({
+                "id": "system",
+                "name": "系统音频输出 (回退 - 可能不可用)",
+                "type": "system"
+            })
+
+        if not any(d['type'] == 'microphone' for d in devices):
+            devices.insert(0, {
+                "id": "default",
+                "name": "默认输入设备",
+                "type": "microphone"
+            })
+
         return devices
 
     async def start_capture(self, device_id: str = "default") -> AsyncGenerator[bytes, None]:
-        if not self.audio:
-            logger.error("PyAudio not available")
+        if not SOUNDDEVICE_AVAILABLE:
+            logger.error("sounddevice not available")
             return
 
         self.is_capturing = True
-        target = self._capture_system if device_id == "system" else self._capture_mic
-        async for data in target(device_id):
-            yield data
 
-    async def _capture_mic(self, device_id: str) -> AsyncGenerator[bytes, None]:
-        device_index = None if device_id == "default" else int(device_id)
+        if device_id.startswith("wasapi_loopback_"):
+            async for data in self._capture_wasapi_loopback(device_id):
+                yield data
+        elif device_id == "system":
+            async for data in self._capture_system_fallback():
+                yield data
+        else:
+            async for data in self._capture_mic(device_id):
+                yield data
+
+    async def _capture_wasapi_loopback(self, device_id: str) -> AsyncGenerator[bytes, None]:
         try:
-            self.stream = self.audio.open(
-                format=self.config.format,
-                channels=self.config.channels,
-                rate=self.config.sample_rate,
-                input=True,
-                input_device_index=device_index,
-                frames_per_buffer=self.config.chunk_size
+            idx = int(device_id.split("_")[-1])
+
+            self.stream = sd.InputStream(
+                device=idx,
+                samplerate=self.config.sample_rate,
+                channels=2,
+                blocksize=self.config.chunk_size,
+                dtype='int16',
+                extra_settings=sd.WasapiSettings(loopback=True)
             )
-            logger.info(f"Microphone capture started: {device_id}")
+            self.stream.start()
+            logger.info(f"WASAPI loopback capture started on device #{idx}")
 
             loop = asyncio.get_event_loop()
             while self.is_capturing:
                 try:
-                    data = await loop.run_in_executor(
-                        None,
-                        lambda: self.stream.read(self.config.chunk_size, exception_on_overflow=False)
+                    data, _ = await loop.run_in_executor(
+                        None, lambda: self.stream.read(self.config.chunk_size)
                     )
-                    yield data
+                    if data is None or (hasattr(data, 'size') and data.size == 0):
+                        continue
+                    if data.ndim == 2 and data.shape[1] >= 2:
+                        mono = data.mean(axis=1).astype(np.int16)
+                    elif data.ndim == 2:
+                        mono = data[:, 0].astype(np.int16)
+                    else:
+                        mono = data.astype(np.int16)
+                    yield mono.tobytes()
+                except sd.PortAudioError as e:
+                    logger.error(f"Loopback read error: {e}")
+                    break
+                except Exception as e:
+                    logger.error(f"Loopback read error: {e}")
+                    break
+
+        except Exception as e:
+            logger.error(f"WASAPI loopback capture error: {e}")
+        finally:
+            self._close_stream()
+
+        if self.is_capturing:
+            logger.warning("WASAPI loopback failed — falling back to default input")
+            async for data in self._capture_mic("default"):
+                yield data
+
+    async def _capture_system_fallback(self) -> AsyncGenerator[bytes, None]:
+        wasapi_idx = self._get_wasapi_hostapi_index()
+        if wasapi_idx is not None:
+            try:
+                all_devices = sd.query_devices()
+                loopback_idx = None
+                for i, dev in enumerate(all_devices):
+                    if dev.get('hostapi') == wasapi_idx and dev['max_input_channels'] > 0 and 'loopback' in dev['name'].lower():
+                        loopback_idx = i
+                        break
+
+                if loopback_idx is not None:
+                    async for data in self._capture_wasapi_loopback(f"wasapi_loopback_{loopback_idx}"):
+                        yield data
+                    return
+            except Exception as e:
+                logger.error(f"System fallback search error: {e}")
+
+        logger.warning("No WASAPI loopback found — trying default output loopback")
+        try:
+            self.stream = sd.InputStream(
+                samplerate=self.config.sample_rate,
+                channels=2,
+                blocksize=self.config.chunk_size,
+                dtype='int16',
+                extra_settings=sd.WasapiSettings(loopback=True)
+            )
+            self.stream.start()
+            logger.info("Default output loopback capture started")
+
+            loop = asyncio.get_event_loop()
+            while self.is_capturing:
+                try:
+                    data, _ = await loop.run_in_executor(
+                        None, lambda: self.stream.read(self.config.chunk_size)
+                    )
+                    if data is None or (hasattr(data, 'size') and data.size == 0):
+                        continue
+                    if data.ndim == 2 and data.shape[1] >= 2:
+                        mono = data.mean(axis=1).astype(np.int16)
+                    elif data.ndim == 2:
+                        mono = data[:, 0].astype(np.int16)
+                    else:
+                        mono = data.astype(np.int16)
+                    yield mono.tobytes()
+                except Exception as e:
+                    logger.error(f"Default loopback read error: {e}")
+                    break
+        except Exception as e:
+            logger.error(f"Default loopback capture error: {e}")
+        finally:
+            self._close_stream()
+
+        if self.is_capturing:
+            logger.warning("All system capture methods failed — falling back to microphone")
+            async for data in self._capture_mic("default"):
+                yield data
+
+    async def _capture_mic(self, device_id: str) -> AsyncGenerator[bytes, None]:
+        try:
+            if device_id == "default":
+                self.stream = sd.InputStream(
+                    samplerate=self.config.sample_rate,
+                    channels=1,
+                    blocksize=self.config.chunk_size,
+                    dtype='int16'
+                )
+            else:
+                idx = int(device_id)
+                self.stream = sd.InputStream(
+                    device=idx,
+                    samplerate=self.config.sample_rate,
+                    channels=1,
+                    blocksize=self.config.chunk_size,
+                    dtype='int16'
+                )
+            self.stream.start()
+            logger.info(f"Microphone capture started: device={device_id}")
+
+            loop = asyncio.get_event_loop()
+            while self.is_capturing:
+                try:
+                    data, _ = await loop.run_in_executor(
+                        None, lambda: self.stream.read(self.config.chunk_size)
+                    )
+                    if data is None or (hasattr(data, 'size') and data.size == 0):
+                        continue
+                    mono = data.astype(np.int16) if data.ndim == 1 else data[:, 0].astype(np.int16)
+                    yield mono.tobytes()
                 except Exception as e:
                     logger.error(f"Mic read error: {e}")
                     break
@@ -124,66 +256,10 @@ class AudioCapture:
         finally:
             self._close_stream()
 
-    async def _capture_system(self, _device_id: str) -> AsyncGenerator[bytes, None]:
-        logger.info("System audio capture starting...")
-
-        loopback_idx = self._find_loopback()
-        if loopback_idx is not None:
-            try:
-                self.stream = self.audio.open(
-                    format=self.config.format,
-                    channels=2,
-                    rate=self.config.sample_rate,
-                    input=True,
-                    input_device_index=loopback_idx,
-                    frames_per_buffer=self.config.chunk_size
-                )
-                logger.info(f"System audio capture started via loopback device #{loopback_idx}")
-
-                loop = asyncio.get_event_loop()
-                while self.is_capturing:
-                    try:
-                        data = await loop.run_in_executor(
-                            None,
-                            lambda: self.stream.read(self.config.chunk_size, exception_on_overflow=False)
-                        )
-                        mono = self._stereo_to_mono(data)
-                        yield mono
-                    except Exception as e:
-                        logger.error(f"Loopback read error: {e}")
-                        break
-            except Exception as e:
-                logger.error(f"Loopback capture error: {e}")
-            finally:
-                self._close_stream()
-
-        if self.is_capturing:
-            logger.warning("No loopback device found — falling back to microphone")
-            async for data in self._capture_mic("default"):
-                yield data
-
-    def _find_loopback(self) -> Optional[int]:
-        if not self.audio:
-            return None
-        keywords = ["loopback", "stereo mix", "wave out", "wasapi"]
-        for i in range(self.audio.get_device_count()):
-            try:
-                name = self.audio.get_device_info_by_index(i).get("name", "").lower()
-                if any(k in name for k in keywords):
-                    return i
-            except Exception:
-                continue
-        return None
-
-    def _stereo_to_mono(self, data: bytes) -> bytes:
-        arr = np.frombuffer(data, dtype=np.int16).reshape(-1, 2)
-        mono = arr.mean(axis=1).astype(np.int16)
-        return mono.tobytes()
-
     def _close_stream(self):
         if self.stream:
             try:
-                self.stream.stop_stream()
+                self.stream.stop()
             except Exception:
                 pass
             try:
@@ -198,12 +274,6 @@ class AudioCapture:
 
     def cleanup(self):
         self.stop_capture()
-        if self.audio:
-            try:
-                self.audio.terminate()
-            except Exception:
-                pass
-            self.audio = None
 
 
 class AudioBuffer:

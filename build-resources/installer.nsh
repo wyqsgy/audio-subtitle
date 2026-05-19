@@ -1,3 +1,5 @@
+﻿Unicode true
+
 !macro customInstall
   CreateShortCut "$DESKTOP\Audio Subtitle.lnk" "$INSTDIR\Audio Subtitle.exe"
 !macroend

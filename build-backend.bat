@@ -33,8 +33,10 @@ pyinstaller --noconfirm --clean --onefile ^
     --hidden-import "numpy" ^
     --hidden-import "faster_whisper" ^
     --hidden-import "ctranslate2" ^
+    --hidden-import "sounddevice" ^
     --collect-all "faster_whisper" ^
     --collect-all "ctranslate2" ^
+    --collect-all "sounddevice" ^
     run.py
 
 echo [3/3] Cleaning up build artifacts...

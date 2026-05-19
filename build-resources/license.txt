@@ -1,4 +1,4 @@
-Audio Subtitle - 实时音频字幕工具
+﻿Audio Subtitle - 实时音频字幕工具
 ====================================
 
 Copyright (c) 2026 Audio Subtitle

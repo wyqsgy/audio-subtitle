@@ -51,30 +51,39 @@ class AudioCapture:
 
         try:
             all_devices = sd.query_devices()
-            for i, dev in enumerate(all_devices):
-                if dev['max_input_channels'] <= 0:
-                    continue
+            used_names = set()
 
+            for i, dev in enumerate(all_devices):
                 is_wasapi = wasapi_idx is not None and dev.get('hostapi') == wasapi_idx
                 name = dev['name']
-                t = 'microphone'
 
-                if is_wasapi and 'loopback' in name.lower():
-                    t = 'system'
+                if is_wasapi and dev['max_output_channels'] > 0:
+                    label = f"系统音频 [{name}]"
+                    if label in used_names:
+                        continue
+                    used_names.add(label)
                     devices.append({
                         "id": f"wasapi_loopback_{i}",
-                        "name": f"系统音频 (WASAPI Loopback)",
+                        "name": f"系统音频 [{name}]",
                         "type": "system",
                         "sample_rate": int(dev['default_samplerate'])
                     })
-                elif not is_wasapi or 'loopback' not in name.lower():
-                    label = "WASAPI" if is_wasapi else "MME"
-                    devices.append({
-                        "id": str(i),
-                        "name": f"[{label}] {name}",
-                        "type": "microphone",
-                        "sample_rate": int(dev['default_samplerate'])
-                    })
+                    continue
+
+                if dev['max_input_channels'] <= 0:
+                    continue
+
+                label = "WASAPI" if is_wasapi else "MME"
+                m_label = f"[{label}] {name}"
+                if m_label in used_names:
+                    continue
+                used_names.add(m_label)
+                devices.append({
+                    "id": str(i),
+                    "name": f"[{label}] {name}",
+                    "type": "microphone",
+                    "sample_rate": int(dev['default_samplerate'])
+                })
         except Exception as e:
             logger.error(f"Device query error: {e}")
 
@@ -165,7 +174,8 @@ class AudioCapture:
                 all_devices = sd.query_devices()
                 loopback_idx = None
                 for i, dev in enumerate(all_devices):
-                    if dev.get('hostapi') == wasapi_idx and dev['max_input_channels'] > 0 and 'loopback' in dev['name'].lower():
+                    if (dev.get('hostapi') == wasapi_idx
+                            and dev['max_output_channels'] > 0):
                         loopback_idx = i
                         break
 

@@ -12,6 +12,13 @@
   <img src="https://img.shields.io/badge/license-MIT-green" />
 </p>
 
+## 🆕 v2.1.0 更新日志
+
+- **会话纪要 UI**：历史面板新增「AI 纪要」按钮——一键生成整场会话的结构化总结（总结 + 要点），内联展示；「导出」按钮将会话字幕（含译文）下载为 SRT；「清空」重置会话缓冲
+- **AI 流式报告（vulnark 同款体验）**：后端 `call_ai_stream` SSE 流式管线
+- **共享兼容层**：翻译 / 字幕优化统一走 [aicompat](https://github.com/wyqsgy/aicompat)
+- **发布流水线**：打 tag 自动构建 Windows 安装包（含 PyInstaller 后端 + electron-builder）并发布到 GitHub Releases
+
 ## 🆕 v2.0.0 更新日志
 
 - **AI 字幕优化**：新增 LLM 字幕后期处理引擎——自动修正 ASR 同音错别字、补全标点、去除语气词（嗯/啊/呃）与卡顿重复、合并被截断的半句；可在设置页一键开关，保留原始识别结果

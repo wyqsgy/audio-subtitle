@@ -1,7 +1,7 @@
-{
+﻿{
   "name": "audio-subtitle",
-  "version": "2.0.0",
-  "description": "实时音频字幕翻译工具 - 将电脑音频实时转为字幕",
+  "version": "2.1.0",
+  "description": "瀹炴椂闊抽瀛楀箷缈昏瘧宸ュ叿 - 灏嗙數鑴戦煶棰戝疄鏃惰浆涓哄瓧骞?,
   "author": "Audio Subtitle",
   "main": "dist-electron/main.js",
   "scripts": {
@@ -30,7 +30,7 @@
   "build": {
     "appId": "com.audiosubtitle.app",
     "productName": "Audio Subtitle",
-    "copyright": "Copyright © 2026 Audio Subtitle",
+    "copyright": "Copyright 漏 2026 Audio Subtitle",
     "directories": {
       "output": "release",
       "buildResources": "build-resources"

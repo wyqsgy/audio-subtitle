@@ -5,7 +5,10 @@ import wave
 import tempfile
 import os
 from typing import Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+# 统一走 aicompat 兼容层（推理模型参数自动兼容）
+from aicompat import build_llm_kwargs  # noqa: F401  (re-export)
 
 logger = logging.getLogger(__name__)
 
@@ -14,17 +17,6 @@ try:
     FASTER_WHISPER_AVAILABLE = True
 except ImportError:
     FASTER_WHISPER_AVAILABLE = False
-
-# 推理模型：不接受 temperature，且需要 max_completion_tokens
-_REASONING_MODEL_PREFIXES = ("o1", "o3", "o4", "gpt-5")
-
-
-def build_llm_kwargs(model: str, temperature: float, max_tokens: int) -> dict:
-    """按模型能力构造 chat/completions 请求参数，保证推理系列模型兼容。"""
-    model_l = (model or "").lower()
-    if any(model_l.startswith(p) for p in _REASONING_MODEL_PREFIXES):
-        return {"model": model, "max_completion_tokens": max_tokens}
-    return {"model": model, "temperature": temperature, "max_tokens": max_tokens}
 
 
 @dataclass

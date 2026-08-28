@@ -1,4 +1,4 @@
-fastapi>=0.115.0
+﻿fastapi>=0.115.0
 uvicorn>=0.30.0
 websockets>=12.0
 openai>=1.50.0
@@ -8,3 +8,4 @@ python-multipart>=0.0.20
 faster-whisper>=1.0.0
 pytest>=8.0
 pytest-asyncio>=0.23
+aicompat @ git+https://github.com/wyqsgy/aicompat.git@v1.0.0

@@ -32,6 +32,7 @@ export interface AppSettings {
   apiKey: string
   apiBaseUrl: string
   localModel: string
+  enhanceSubtitles: boolean
 }
 
 const defaultSettings: AppSettings = {
@@ -46,7 +47,8 @@ const defaultSettings: AppSettings = {
   opacity: 0.95,
   apiKey: '',
   apiBaseUrl: 'https://api.openai.com/v1',
-  localModel: 'base'
+  localModel: 'base',
+  enhanceSubtitles: true
 }
 
 function App() {
@@ -102,7 +104,8 @@ function App() {
         source_language: current.sourceLanguage,
         target_language: current.targetLanguage,
         recognition_mode: current.recognitionMode,
-        local_model: current.localModel
+        local_model: current.localModel,
+        enhance_subtitles: current.enhanceSubtitles
       }
     }))
   }, [])

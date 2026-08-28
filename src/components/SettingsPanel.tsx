@@ -43,7 +43,8 @@ const defaults: AppSettings = {
   opacity: 0.95,
   apiKey: '',
   apiBaseUrl: 'https://api.openai.com/v1',
-  localModel: 'base'
+  localModel: 'base',
+  enhanceSubtitles: true
 }
 
 export default function SettingsPanel({
@@ -217,6 +218,23 @@ export default function SettingsPanel({
               <label>API Key</label>
               <input type="password" placeholder="sk-..." value={settings.apiKey}
                 onChange={e => handleChange({ apiKey: e.target.value })} />
+            </div>
+            <div className="form-row">
+              <label>AI 字幕优化</label>
+              <div className="radio-group">
+                <label className="radio-option">
+                  <input type="radio" name="enhance" value="on"
+                    checked={settings.enhanceSubtitles}
+                    onChange={() => handleChange({ enhanceSubtitles: true })} />
+                  <span>开启 — 修正错别字、补全标点、去除语气词</span>
+                </label>
+                <label className="radio-option">
+                  <input type="radio" name="enhance" value="off"
+                    checked={!settings.enhanceSubtitles}
+                    onChange={() => handleChange({ enhanceSubtitles: false })} />
+                  <span>关闭 — 保留原始识别结果</span>
+                </label>
+              </div>
             </div>
           </div>
         )}

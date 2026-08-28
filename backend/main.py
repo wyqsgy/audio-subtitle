@@ -9,10 +9,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from audio_capture import AudioCapture, AudioBuffer
-from services import AudioSubtitleService, STTConfig, LocalSTTConfig, TranslationConfig
+from services import (
+    AudioSubtitleService, STTConfig, LocalSTTConfig,
+    TranslationConfig, EnhancerConfig, SummaryConfig,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+APP_VERSION = "2.0.0"
 
 audio_capture: Optional[AudioCapture] = None
 subtitle_service: Optional[AudioSubtitleService] = None
@@ -27,9 +32,10 @@ class SettingsModel(BaseModel):
     source_language: str = "auto"
     target_language: str = "zh"
     stt_model: str = "whisper-1"
-    translation_model: str = "gpt-3.5-turbo"
+    translation_model: str = "gpt-4o-mini"
     recognition_mode: str = "local"
     local_model: str = "base"
+    enhance_subtitles: bool = True
 
 
 class CaptureRequest(BaseModel):
@@ -47,21 +53,21 @@ async def lifespan(app: FastAPI):
     subtitle_service = AudioSubtitleService(
         local_stt_config=LocalSTTConfig(model_size="base")
     )
-    logger.info("Audio Subtitle Service started")
+    logger.info(f"Audio Subtitle Service v{APP_VERSION} started")
     yield
     if audio_capture:
         audio_capture.cleanup()
     logger.info("Audio Subtitle Service stopped")
 
 
-app = FastAPI(title="Audio Subtitle Service", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Audio Subtitle Service", version=APP_VERSION, lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
-                    allow_methods=["*"], allow_headers=["*"])
+                   allow_methods=["*"], allow_headers=["*"])
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok"}
+    return {"status": "ok", "version": APP_VERSION}
 
 
 @app.get("/devices")
@@ -78,6 +84,7 @@ async def update_settings(s: SettingsModel):
         return {"status": "error", "message": "Service not ready"}
 
     subtitle_service.set_mode(s.recognition_mode)
+    subtitle_service.set_enhance(s.enhance_subtitles)
 
     if s.recognition_mode == "api" and s.api_key:
         subtitle_service.update_api_stt(STTConfig(
@@ -87,6 +94,15 @@ async def update_settings(s: SettingsModel):
         subtitle_service.update_translator(TranslationConfig(
             api_key=s.api_key, base_url=s.api_base_url, model=s.translation_model,
             source_language=s.source_language, target_language=s.target_language
+        ))
+        # 字幕优化与会话纪要共用 API 凭据
+        subtitle_service.update_enhancer(EnhancerConfig(
+            api_key=s.api_key, base_url=s.api_base_url,
+            language=s.target_language if s.source_language != "auto" else None
+        ))
+        subtitle_service.update_summary_service(SummaryConfig(
+            api_key=s.api_key, base_url=s.api_base_url,
+            language=s.target_language
         ))
     elif s.recognition_mode == "local":
         subtitle_service.update_local_stt(LocalSTTConfig(
@@ -136,6 +152,55 @@ async def get_status():
     }
 
 
+# ---------------------------------------------------------------------------
+# 会话纪要（AI）：基于本次会话累计字幕生成摘要
+# ---------------------------------------------------------------------------
+@app.post("/summary")
+async def generate_summary():
+    if not subtitle_service:
+        raise HTTPException(503, "Service not ready")
+    if not subtitle_service.summary_service:
+        return {"status": "error", "message": "会话纪要需要配置 API Key（API 识别模式下自动启用）"}
+    texts = subtitle_service.get_session_texts()
+    if not texts:
+        return {"status": "empty", "message": "当前会话还没有字幕内容", "data": {"summary": "", "key_points": []}}
+    result = await subtitle_service.summary_service.summarize(texts)
+    return {"status": "ok", "data": result}
+
+
+@app.post("/session/clear")
+async def clear_session():
+    if subtitle_service:
+        subtitle_service.clear_session()
+    return {"status": "ok"}
+
+
+@app.get("/session/export")
+async def export_session():
+    """导出当前会话全部字幕（SRT 格式）。"""
+    if not subtitle_service:
+        raise HTTPException(503, "Service not ready")
+    texts = subtitle_service.get_session_texts()
+    lines = []
+    for i, text in enumerate(texts, 1):
+        parts = text.split("\n", 1)
+        original = parts[0]
+        translation = parts[1] if len(parts) > 1 else ""
+        start = _srt_time((i - 1) * 4)
+        end = _srt_time(i * 4)
+        lines.append(f"{i}\n{start} --> {end}\n{original}" +
+                     (f"\n{translation}" if translation else "") + "\n")
+    return {"format": "srt", "content": "\n".join(lines), "count": len(texts)}
+
+
+def _srt_time(seconds: float) -> str:
+    ms = int(seconds * 1000)
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
 async def process_audio_stream(device_id: str, translate: bool, chunk_duration: float):
     global audio_buffer
     if not audio_capture or not audio_buffer:
@@ -165,7 +230,8 @@ async def process_audio_stream(device_id: str, translate: bool, chunk_duration: 
                     if result["original"]:
                         await broadcast_subtitle({
                             "original": result["original"],
-                            "translation": result["translation"]
+                            "translation": result["translation"],
+                            "enhanced": result.get("enhanced", False)
                         })
     except asyncio.CancelledError:
         pass

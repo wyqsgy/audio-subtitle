@@ -8,4 +8,4 @@ python-multipart>=0.0.20
 faster-whisper>=1.0.0
 pytest>=8.0
 pytest-asyncio>=0.23
-aicompat @ git+https://github.com/wyqsgy/aicompat.git@v1.0.0
+aicompat @ git+https://github.com/wyqsgy/aicompat.git@v1.1.0

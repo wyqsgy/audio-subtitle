@@ -7,8 +7,8 @@ import os
 from typing import Optional
 from dataclasses import dataclass
 
-# 统一走 aicompat 兼容层（推理模型参数自动兼容）
-from aicompat import build_llm_kwargs  # noqa: F401  (re-export)
+# 统一走 aicompat 兼容层（推理模型参数自动兼容 + 指数退避重试）
+from aicompat import RETRYABLE_STATUS, aretry, build_llm_kwargs  # noqa: F401  (build_llm_kwargs re-export)
 
 logger = logging.getLogger(__name__)
 
@@ -167,20 +167,46 @@ class APISpeechToTextService:
 
 
 class _ChatClientMixin:
-    """共享的 AsyncOpenAI 懒加载客户端。子类需提供 self.config（含 api_key/base_url）。"""
+    """共享的 AsyncOpenAI 懒加载客户端与统一 chat 调用。
+
+    子类需提供 self.config（含 api_key/base_url/model）。
+    """
 
     @property
     def client(self):
         if getattr(self, "_client", None) is None:
             from openai import AsyncOpenAI
             self._client = AsyncOpenAI(
-                api_key=self.config.api_key, base_url=self.config.base_url
+                api_key=self.config.api_key,
+                base_url=self.config.base_url,
+                max_retries=0,  # SDK 内置重试关闭：统一由 aicompat.aretry 承担
             )
         return self._client
 
     @property
     def ready(self) -> bool:
         return bool(getattr(self.config, "api_key", ""))
+
+    async def _achat(self, messages: list, temperature: float = 0.2, max_tokens: int = 512):
+        """统一的 LLM chat 调用：aicompat.aretry 指数退避，仅重试 429/5xx/网络错误。"""
+        async def _attempt():
+            return await self.client.chat.completions.create(
+                messages=messages,
+                **build_llm_kwargs(self.config.model, temperature=temperature, max_tokens=max_tokens),
+            )
+
+        def _retryable(e: Exception) -> bool:
+            try:
+                import openai
+            except ImportError:
+                return True
+            if isinstance(e, (openai.APITimeoutError, openai.APIConnectionError)):
+                return True
+            if isinstance(e, openai.APIStatusError):
+                return getattr(e, "status_code", 0) in RETRYABLE_STATUS
+            return False
+
+        return await aretry(_attempt, retries=3, base_delay=1.0, retry_on=_retryable)
 
 
 class TranslationService(_ChatClientMixin):
@@ -200,13 +226,10 @@ class TranslationService(_ChatClientMixin):
                            target_lang or self.config.target_language)
 
         try:
-            resp = await self.client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": "你是专业翻译。只输出翻译结果，不要加解释。"},
-                    {"role": "user", "content": f"翻译成{tgt}：\n{text}"}
-                ],
-                **build_llm_kwargs(self.config.model, temperature=0.2, max_tokens=512)
-            )
+            resp = await self._achat([
+                {"role": "system", "content": "你是专业翻译。只输出翻译结果，不要加解释。"},
+                {"role": "user", "content": f"翻译成{tgt}：\n{text}"},
+            ], temperature=0.2, max_tokens=512)
             return (resp.choices[0].message.content or "").strip()
         except Exception as e:
             logger.error(f"Translation error: {e}")
@@ -226,16 +249,13 @@ class SubtitleEnhancer(_ChatClientMixin):
 
         lang_hint = f"使用{self.config.language}输出" if self.config.language else "保持原文语言"
         try:
-            resp = await self.client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content":
-                        "你是实时字幕后期处理引擎。对语音识别结果做最小修正："
-                        "1) 修正同音错别字 2) 补全标点符号 3) 去除语气词（嗯、啊、呃）与卡顿重复 4) 合并被截断的半句。"
-                        "禁止改写意思、禁止增删信息、禁止回答或评论内容，只输出修正后的字幕文本。"},
-                    {"role": "user", "content": f"{lang_hint}：\n{text}"}
-                ],
-                **build_llm_kwargs(self.config.model, temperature=0.0, max_tokens=512)
-            )
+            resp = await self._achat([
+                {"role": "system", "content":
+                    "你是实时字幕后期处理引擎。对语音识别结果做最小修正："
+                    "1) 修正同音错别字 2) 补全标点符号 3) 去除语气词（嗯、啊、呃）与卡顿重复 4) 合并被截断的半句。"
+                    "禁止改写意思、禁止增删信息、禁止回答或评论内容，只输出修正后的字幕文本。"},
+                {"role": "user", "content": f"{lang_hint}：\n{text}"},
+            ], temperature=0.0, max_tokens=512)
             return (resp.choices[0].message.content or "").strip() or text
         except Exception as e:
             logger.error(f"Subtitle enhance error: {e}")
@@ -256,16 +276,13 @@ class SummaryService(_ChatClientMixin):
         content = "\n".join(t for t in texts if t.strip())[-12000:]
         lang = "中文" if self.config.language.startswith("zh") else self.config.language
         try:
-            resp = await self.client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content":
-                        "你是会议/语音内容纪要助手。根据字幕内容输出 JSON："
-                        '{"summary": "一段话总结", "key_points": ["要点1", "要点2", ...], "topics": ["主题"]}。'
-                        "只输出 JSON。"},
-                    {"role": "user", "content": f"用{lang}归纳以下字幕内容：\n{content}"}
-                ],
-                **build_llm_kwargs(self.config.model, temperature=0.2, max_tokens=1024)
-            )
+            resp = await self._achat([
+                {"role": "system", "content":
+                    "你是会议/语音内容纪要助手。根据字幕内容输出 JSON："
+                    '{"summary": "一段话总结", "key_points": ["要点1", "要点2", ...], "topics": ["主题"]}。'
+                    "只输出 JSON。"},
+                {"role": "user", "content": f"用{lang}归纳以下字幕内容：\n{content}"},
+            ], temperature=0.2, max_tokens=1024)
             raw = (resp.choices[0].message.content or "").strip()
             return self._parse_json(raw)
         except Exception as e:

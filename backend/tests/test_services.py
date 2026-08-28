@@ -140,3 +140,61 @@ class TestSummaryFallback:
         svc = SummaryService(__import__("services").SummaryConfig(api_key="sk-x"))
         result = asyncio.run(svc.summarize([]))
         assert result == {"summary": "", "key_points": []}
+
+
+class TestAchatRetry:
+    @pytest.mark.asyncio
+    async def test_retry_on_rate_limit(self, monkeypatch):
+        """429 限流应经 aicompat.aretry 自动重试。"""
+        import httpx
+        import openai
+        from types import SimpleNamespace
+        from services import TranslationService, TranslationConfig
+
+        svc = TranslationService(TranslationConfig(api_key="sk-x", model="gpt-4o-mini"))
+        calls = {"n": 0}
+
+        class FakeCompletions:
+            async def create(self, **kw):
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    req = httpx.Request("POST", "http://x")
+                    raise openai.RateLimitError("rate limited", response=httpx.Response(429, request=req), body=None)
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="hello"))])
+
+        svc._client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+
+        async def nosleep(s):
+            pass
+
+        monkeypatch.setattr("asyncio.sleep", nosleep)
+        out = await svc.translate("hi", target_lang="zh")
+        assert out == "hello"
+        assert calls["n"] == 3
+
+    @pytest.mark.asyncio
+    async def test_no_retry_on_auth_error(self, monkeypatch):
+        """401 鉴权失败不应重试。"""
+        import httpx
+        import openai
+        from types import SimpleNamespace
+        from services import TranslationService, TranslationConfig
+
+        svc = TranslationService(TranslationConfig(api_key="sk-bad", model="gpt-4o-mini"))
+        calls = {"n": 0}
+
+        class FakeCompletions:
+            async def create(self, **kw):
+                calls["n"] += 1
+                req = httpx.Request("POST", "http://x")
+                raise openai.AuthenticationError("bad key", response=httpx.Response(401, request=req), body=None)
+
+        svc._client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+
+        async def nosleep(s):
+            pass
+
+        monkeypatch.setattr("asyncio.sleep", nosleep)
+        out = await svc.translate("hi", target_lang="zh")
+        assert out == ""
+        assert calls["n"] == 1
